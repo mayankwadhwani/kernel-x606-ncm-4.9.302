@@ -108,6 +108,9 @@ struct gether {
 
 	bool				is_zlp_ok;
 
+	/* NCM sets this from gadget_avoids_skb_reserve() (backport for f_ncm). */
+	bool				no_skb_reserve;
+
 	u16				cdc_filter;
 
 	/* hooks for added framing, as needed for RNDIS and EEM. */
