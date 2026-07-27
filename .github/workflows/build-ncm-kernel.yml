@@ -1,0 +1,132 @@
+name: Build NCM Kernel (TB-X606V)
+
+# Builds the achilles6 (MT6765) kernel with CDC-NCM USB gadget enabled so USB
+# tethering is detectable by macOS, then repacks it into the stock boot.img.
+# Output: boot-ncm.img as a downloadable artifact. Flashing is done locally.
+
+permissions:
+  contents: read
+
+on:
+  workflow_dispatch:
+    inputs:
+      defconfig:
+        description: 'Defconfig to build'
+        type: string
+        default: achilles6_row_call_ncm_defconfig
+
+jobs:
+  build:
+    # 22.04 still ships python2 in universe (MTK DrvGen is Python 2); 24.04 dropped it.
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout kernel source
+        uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bc bison flex libssl-dev build-essential \
+            libncurses-dev gzip cpio python3 git ca-certificates
+          # MTK's DrvGen device-tree generator (tools/dct) is Python 2 only.
+          sudo apt-get install -y --no-install-recommends python2 python2.7 || true
+          PY2="$(command -v python2 || command -v python2.7 || true)"
+          test -n "$PY2" || { echo "ERROR: python2 unavailable on this runner"; exit 1; }
+          echo "PY2=$PY2" >> $GITHUB_ENV
+          echo "Using python2 at: $PY2"
+
+      - name: Fetch AOSP toolchain (GCC 4.9 aarch64 + Clang r4691093)
+        run: |
+          mkdir -p toolchains/clang toolchains/gcc
+          # AOSP prebuilt aarch64 GCC 4.9 (binutils / cross tools). The default branch is empty;
+          # android10-gsi carries the actual binaries for this era.
+          git clone --depth 1 -b android10-gsi \
+            https://android.googlesource.com/platform/prebuilts/gcc/linux-x86/aarch64/aarch64-linux-android-4.9 \
+            toolchains/gcc
+          # Build with the newest clang on this branch (clang-r353983c). Kernel 4.9 builds fine with
+          # it; the original Lenovo clang-4691093 (Pie-era) is not present in android-10.0.0_r47.
+          # Sparse-checkout only that one clang dir instead of the multi-GB full repo (far faster).
+          CLANG_VER=clang-r353983c
+          git clone --no-checkout --depth 1 --filter=blob:none -b android-10.0.0_r47 \
+            https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 \
+            toolchains/clang-src
+          ( cd toolchains/clang-src
+            git sparse-checkout init --cone
+            git sparse-checkout set "$CLANG_VER"
+            git checkout )
+          CLANG_DIR=$(find toolchains/clang-src -maxdepth 1 -type d -name "$CLANG_VER" | head -1)
+          test -n "$CLANG_DIR" || { echo "ERROR: $CLANG_VER not found"; ls toolchains/clang-src; exit 1; }
+          echo "CLANG_DIR=$GITHUB_WORKSPACE/$CLANG_DIR" >> $GITHUB_ENV
+          # Locate the GCC binutils by finding objdump, so CROSS_COMPILE prefix + dir are correct
+          # regardless of the prebuilt's internal layout.
+          OBJDUMP=$(find toolchains/gcc -name '*-objdump' -type f | head -1)
+          test -n "$OBJDUMP" || { echo "ERROR: aarch64 GCC binutils not found in clone"; find toolchains/gcc -maxdepth 3 -type d; exit 1; }
+          GCC_BIN=$(cd "$(dirname "$OBJDUMP")" && pwd)
+          GCC_PREFIX=$(basename "$OBJDUMP" | sed 's/objdump$//')   # e.g. aarch64-linux-android-
+          echo "GCC_DIR=$GCC_BIN" >> $GITHUB_ENV
+          echo "CROSS_COMPILE=$GCC_PREFIX" >> $GITHUB_ENV
+          echo "Using clang at: $CLANG_DIR"
+          echo "GCC binutils: $GCC_BIN  prefix: $GCC_PREFIX"
+          ls "$CLANG_DIR/bin" | head
+          ls "$GCC_BIN" | grep -E 'objdump|-as$|-ld$' | head
+
+      - name: Build kernel (Image.gz-dtb)
+        run: |
+          export PATH="$GCC_DIR:$CLANG_DIR/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          # python=$PY2 routes MTK's DrvGen (Python 2) through python2; the kernel's
+          # own scripts still use python3 from PATH.
+          # HOSTCFLAGS -fcommon: gcc-10+ defaults to -fno-common, which breaks this old
+          # tree's host tools (scripts/dtc: "multiple definition of yylloc").
+          # KAFLAGS -no-integrated-as: force the old MTK VDSO/.S assembly through GNU as (clang's
+          # integrated assembler rejects its multi-arg .macro syntax). Keep this OUT of KCFLAGS:
+          # applying it to C compilation breaks the kernel's -fstack-protector-strong capability
+          # probe. HOSTCFLAGS -fcommon works around gcc-10+ host-tool link errors (dtc yylloc).
+          export KAFLAGS="-no-integrated-as"
+          # HOST_EXTRACFLAGS APPENDS to the default HOSTCFLAGS (setting HOSTCFLAGS= would clobber
+          # -O2/-Wall and break host tools). -fcommon fixes gcc-10+ dtc "multiple definition" link.
+          export HOST_EXTRACFLAGS="-fcommon"
+          MAKE_ARGS="-j$(nproc) ARCH=arm64 O=out \
+            CROSS_COMPILE=$CROSS_COMPILE \
+            CLANG_TRIPLE=aarch64-linux-gnu- \
+            CC=clang python=$PY2"
+          echo "CROSS_COMPILE=$CROSS_COMPILE ; objdump: $(command -v ${CROSS_COMPILE}objdump || echo MISSING)"
+          make $MAKE_ARGS "${{ inputs.defconfig }}"
+          # Confirm NCM landed in the expanded config before the long build.
+          grep -E 'CONFIG_USB_CONFIGFS_NCM|CONFIG_USB_F_NCM' out/.config || \
+            { echo "ERROR: NCM not enabled in expanded config"; exit 1; }
+          make $MAKE_ARGS
+          ls -la out/arch/arm64/boot/
+
+      # Save the built kernel FIRST, so it is available for local repack even if the repack below fails.
+      - name: Upload built kernel (Image.gz-dtb)
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-image
+          path: out/arch/arm64/boot/Image.gz-dtb
+          if-no-files-found: error
+
+      - name: Repack boot.img with new kernel (AOSP mkbootimg)
+        run: |
+          # Use AOSP's pure-Python unpack_bootimg/mkbootimg (runs anywhere, no native binary).
+          git clone --depth 1 https://android.googlesource.com/platform/system/tools/mkbootimg mkbi
+          test -f stock_boot.img || { echo "ERROR: stock_boot.img missing from repo"; exit 1; }
+          python3 mkbi/unpack_bootimg.py --boot_img stock_boot.img --out unpacked --format mkbootimg > mkargs.txt
+          echo "--- mkbootimg args from stock image ---"; cat mkargs.txt
+          # Swap in the freshly built kernel in place; the mkargs already reference unpacked/kernel,
+          # so overwriting the file keeps every other component + header param identical.
+          cp out/arch/arm64/boot/Image.gz-dtb unpacked/kernel
+          # eval so the quoted --board '' / --cmdline '...' args word-split correctly.
+          eval "python3 mkbi/mkbootimg.py $(cat mkargs.txt) -o boot-ncm.img"
+          ls -la boot-ncm.img
+          python3 mkbi/unpack_bootimg.py --boot_img boot-ncm.img --out verify >/dev/null
+          echo "Repack OK"
+
+      - name: Upload boot-ncm.img artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: boot-ncm
+          path: boot-ncm.img
+          if-no-files-found: error
